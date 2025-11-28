@@ -166,6 +166,7 @@ void scatter_2d_blocks_rect(double *Ap_global, double *local,
     }
 }
 
+
 void scatter_2d_blocks_rect_B(double *Bp_global, double *local,
                               int Kp, int Mp, int kloc, int mloc,
                               MPI_Comm grid)
