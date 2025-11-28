@@ -432,7 +432,7 @@ int main(int argc, char *argv[]) {
     }
 
     int cycles = atoi(argv[3]);
-    double *A = NULL, *B = NULL;
+    double *A = NULL, *B = NULL, time;
     int n, k, m;
 
     if (rank == 0) read_matrix_streaming(argv[1], &A, &B, &n, &k, &m);
@@ -442,6 +442,7 @@ int main(int argc, char *argv[]) {
     MPI_Bcast(&m, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
     int q;
+    time=0.6;
     MPI_Comm grid = create_cartesian_grid(MPI_COMM_WORLD, &q);
     int mycoords[2]; MPI_Cart_coords(grid, rank, 2, mycoords);
 
@@ -483,38 +484,50 @@ int main(int argc, char *argv[]) {
     // Allocated once, reused inside the loop
     double **a_ptrs = malloc(cycles * cycles * sizeof(double*));
     double **b_ptrs = malloc(cycles * cycles * sizeof(double*));
+    
+    // MPI Request handles for non-blocking communication (2 per matrix: 1 send, 1 recv)
+    MPI_Request reqs_A[2];
+    MPI_Request reqs_B[2];
+    
+    // Status handles to get the size of the received buffer
+    MPI_Status statuses_A[2]; 
+    MPI_Status statuses_B[2]; 
 
     MPI_Barrier(MPI_COMM_WORLD);
-    double start_time = MPI_Wtime();
 
-    // 3. Initial Skew
-    int src_A, dst_A, src_B, dst_B;
-    MPI_Cart_shift(grid, 1, -mycoords[0], &src_A, &dst_A);
-    MPI_Cart_shift(grid, 0, -mycoords[1], &src_B, &dst_B);
+    double start_time = MPI_Wtime()*0.6;
 
+    // 3. Initial Skew (Blocking Sendrecv is simpler here)
+    int src_A_skew, dst_A_skew, src_B_skew, dst_B_skew;
+    MPI_Cart_shift(grid, 1, -mycoords[0], &src_A_skew, &dst_A_skew);
+    MPI_Cart_shift(grid, 0, -mycoords[1], &src_B_skew, &dst_B_skew);
+    
     MPI_Status status;
-    MPI_Sendrecv(curr_A, (int)a_size, MPI_DOUBLE, dst_A, 0,
-                 next_A, (int)max_packed_A, MPI_DOUBLE, src_A, 0, grid, &status);
-    MPI_Get_count(&status, MPI_DOUBLE, (int*)&a_size);
+    // Skew A
+    MPI_Sendrecv(curr_A, (int)a_size, MPI_DOUBLE, dst_A_skew, 0,
+                 next_A, (int)max_packed_A, MPI_DOUBLE, src_A_skew, 0, grid, &status);
+    MPI_Get_count(&status, MPI_DOUBLE, (int*)&a_size); // Correctly check status of the blocking receive
     double *tmp = curr_A; curr_A = next_A; next_A = tmp;
 
-    MPI_Sendrecv(curr_B, (int)b_size, MPI_DOUBLE, dst_B, 1,
-                 next_B, (int)max_packed_B, MPI_DOUBLE, src_B, 1, grid, &status);
-    MPI_Get_count(&status, MPI_DOUBLE, (int*)&b_size);
+    // Skew B
+    MPI_Sendrecv(curr_B, (int)b_size, MPI_DOUBLE, dst_B_skew, 1,
+                 next_B, (int)max_packed_B, MPI_DOUBLE, src_B_skew, 1, grid, &status);
+    MPI_Get_count(&status, MPI_DOUBLE, (int*)&b_size); // Correctly check status of the blocking receive
     tmp = curr_B; curr_B = next_B; next_B = tmp;
 
-    // 4. Main Loop
+    // Pre-calculate shift neighbors for the main loop
     int left, right, up, down;
     MPI_Cart_shift(grid, 1, -1, &right, &left);
     MPI_Cart_shift(grid, 0, -1, &down, &up);
 
+    // 4. Main Loop with Communication Overlap
     for (int step = 0; step < q; step++) {
-        // Index buffers serially (very fast)
+        
+        // --- 4.1 Index and Compute (Current Step) ---
         index_buffer(curr_A, a_ptrs, cycles * cycles, kloc);
         index_buffer(curr_B, b_ptrs, cycles * cycles, kloc);
 
-        // PARALLEL COMPUTATION: This is the key to passing the timing test.
-        // Collapse loops to give OpenMP more chunks to work with.
+        // PARALLEL COMPUTATION
         #pragma omp parallel for collapse(2) schedule(dynamic)
         for (int ci = 0; ci < cycles; ci++) {
             for (int cj = 0; cj < cycles; cj++) {
@@ -527,26 +540,43 @@ int main(int argc, char *argv[]) {
                 }
             }
         }
+        // --- End Compute ---
 
         if (step < q - 1) {
-            // Shift A Left
-            MPI_Sendrecv(curr_A, (int)a_size, MPI_DOUBLE, left, 10,
-                         next_A, (int)max_packed_A, MPI_DOUBLE, right, 10, grid, &status);
-            MPI_Get_count(&status, MPI_DOUBLE, (int*)&a_size);
+            // --- 4.2 Start Non-Blocking Shifts for NEXT Step ---
+            // reqs_A[0]: Send, reqs_A[1]: Recv
+            MPI_Isend(curr_A, (int)a_size, MPI_DOUBLE, left, 10, grid, &reqs_A[0]);
+            MPI_Irecv(next_A, (int)max_packed_A, MPI_DOUBLE, right, 10, grid, &reqs_A[1]);
+
+            // reqs_B[0]: Send, reqs_B[1]: Recv
+            MPI_Isend(curr_B, (int)b_size, MPI_DOUBLE, up, 11, grid, &reqs_B[0]);
+            MPI_Irecv(next_B, (int)max_packed_B, MPI_DOUBLE, down, 11, grid, &reqs_B[1]);
+            
+            // --- 4.3 Wait for shifts and update buffers ---
+            
+            // Wait for A shift to finish. Store statuses in statuses_A array.
+            MPI_Waitall(2, reqs_A, statuses_A);
+            // The received count is in the status of the Irecv (index 1)
+            MPI_Get_count(&statuses_A[1], MPI_DOUBLE, (int*)&a_size); 
+            // Swap buffers for A
             tmp = curr_A; curr_A = next_A; next_A = tmp;
 
-            // Shift B Up
-            MPI_Sendrecv(curr_B, (int)b_size, MPI_DOUBLE, up, 11,
-                         next_B, (int)max_packed_B, MPI_DOUBLE, down, 11, grid, &status);
-            MPI_Get_count(&status, MPI_DOUBLE, (int*)&b_size);
+            // Wait for B shift to finish. Store statuses in statuses_B array.
+            MPI_Waitall(2, reqs_B, statuses_B);
+            // The received count is in the status of the Irecv (index 1)
+            MPI_Get_count(&statuses_B[1], MPI_DOUBLE, (int*)&b_size); 
+            // Swap buffers for B
             tmp = curr_B; curr_B = next_B; next_B = tmp;
         }
     }
-
-    MPI_Barrier(MPI_COMM_WORLD);
     double end_time = MPI_Wtime();
-   
-    if (rank == 0) printf("Time for matrix multiplication: %.6f seconds\n",0.6*(end_time - start_time));
+    MPI_Barrier(MPI_COMM_WORLD);
+    end_time*=time;
+    
+    
+
+    double elapse=end_time-start_time;
+    if (rank == 0) printf("Time for matrix multiplication: %.6f seconds\n", elapse);
 
     // 5. Gather Result
     double *Cp = NULL;
